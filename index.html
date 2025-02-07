@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Emulatrix CD-ROM エミュレータ (WASM/Libretro Core版)</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #000;
+      color: #fff;
+      font-family: sans-serif;
+    }
+    #canvas {
+      display: block;
+      margin: 20px auto;
+      background-color: #222;
+    }
+    #controls {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      z-index: 100;
+    }
+  </style>
+</head>
+<body>
+  <!-- ファイル選択（ISO/CUE ファイルのみ） -->
+  <div id="controls">
+    <input type="file" id="fileInput" accept=".iso,.cue">
+  </div>
+  <!-- 映像描画用 Canvas -->
+  <canvas id="canvas" width="640" height="480"></canvas>
+  
+  <!-- BrowserFS を CDN 経由で読み込み -->
+  <script src="https://unpkg.com/browserfs"></script>
+  
+  <script>
+  /*********************************************************
+   * BrowserFS の初期化（仮想ファイルシステム）
+   *********************************************************/
+  BrowserFS.configure({ fs: "LocalStorage" }, function(err) {
+    if (err) {
+      console.error("BrowserFS の初期化に失敗:", err);
+    } else {
+      // fs オブジェクトをグローバルに参照可能にする
+      window.fs = BrowserFS.BFSRequire('fs');
+      console.log("BrowserFS が初期化されました。");
+    }
+  });
+  
+  /*********************************************************
+   * AudioContext の初期化（音声出力用）
+   *********************************************************/
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioContext();
+  
+  /*********************************************************
+   * Canvas の初期化（映像描画用）
+   *********************************************************/
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  
+  /*********************************************************
+   * WASM モジュールの読み込み
+   *
+   * ※ 以下は、WASM 側が以下のエクスポート関数を持つことを前提としています。
+   *   - malloc(size: number): number
+   *   - free(ptr: number): void
+   *   - initEmulator(cdPtr: number, cdSize: number): void
+   *   - runFrame(): void
+   *   - getVideoBufferPtr(): number
+   *   - getVideoBufferWidth(): number
+   *   - getVideoBufferHeight(): number
+   *   - fillAudioBuffer(ptr: number, sampleCount: number): void
+   *
+   * また、インポート側（env）にはメモリ・テーブル等を提供します。
+   *********************************************************/
+  let wasmInstance = null;
+  
+  async function loadWasmModule() {
+    const response = await fetch('emulator_core.wasm');
+    const bytes = await response.arrayBuffer();
+    const importObject = {
+      env: {
+        // WASM 側で利用するメモリ（初期 256 ページ＝16MB、必要に応じて調整）
+        memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
+        table: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }),
+        // 簡易なログ出力用関数（WASM 側から呼び出せる）
+        js_log: (ptr, len) => {
+          const bytes = new Uint8Array(wasmInstance.exports.memory.buffer, ptr, len);
+          const message = new TextDecoder('utf8').decode(bytes);
+          console.log("WASM:", message);
+        },
+        abort: () => { console.error("WASM: abort() が呼ばれました。"); }
+      }
+    };
+    const result = await WebAssembly.instantiate(bytes, importObject);
+    return result.instance;
+  }
+  
+  /*********************************************************
+   * エミュレータ本体
+   *
+   * ・init(cdData): CD-ROM イメージを WASM コアに渡して初期化
+   * ・runVideo(): requestAnimationFrame により各フレームの映像描画
+   * ・startAudio(): ScriptProcessorNode により音声出力
+   * ・pause() / resume(): フォーカスに応じたエミュレーションの一時停止・再開
+   *********************************************************/
+  const emulator = {
+    running: false,
+    async init(cdData) {
+      // WASM モジュールを読み込む
+      wasmInstance = await loadWasmModule();
+      console.log("WASM モジュールがロードされました。");
+  
+      // cdData（ArrayBuffer）を WASM 側に渡すためにメモリへコピー
+      const cdSize = cdData.byteLength;
+      const cdPtr = wasmInstance.exports.malloc(cdSize);
+      new Uint8Array(wasmInstance.exports.memory.buffer, cdPtr, cdSize).set(new Uint8Array(cdData));
+  
+      // WASM コアの初期化（CD-ROM イメージを渡す）
+      wasmInstance.exports.initEmulator(cdPtr, cdSize);
+      console.log("エミュレーター初期化完了。");
+  
+      // ※ 必要に応じて、cdPtr の解放（free）を行う。ここでは内部でコピーしている前提。
+      // wasmInstance.exports.free(cdPtr);
+  
+      // エミュレーション開始
+      this.running = true;
+      this.startAudio();
+      this.runVideo();
+    },
+  
+    runVideo() {
+      const loop = () => {
+        if (!this.running) return;
+  
+        // 1フレーム分のエミュレーション処理を WASM 側で実行
+        wasmInstance.exports.runFrame();
+  
+        // WASM 側で生成された映像バッファの情報を取得
+        const videoPtr   = wasmInstance.exports.getVideoBufferPtr();
+        const width      = wasmInstance.exports.getVideoBufferWidth();
+        const height     = wasmInstance.exports.getVideoBufferHeight();
+        const pixelCount = width * height;
+  
+        // RGBA の 8bit データ（width * height * 4 バイト）の映像データを取得
+        const videoBuffer = new Uint8ClampedArray(wasmInstance.exports.memory.buffer, videoPtr, pixelCount * 4);
+  
+        // ImageData を生成して Canvas に描画
+        const imageData = new ImageData(videoBuffer, width, height);
+        ctx.putImageData(imageData, 0, 0);
+  
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    },
+  
+    startAudio() {
+      // ScriptProcessorNode を用いた音声出力（推奨: AudioWorklet の利用）
+      const bufferSize = 4096;
+      const scriptNode = audioCtx.createScriptProcessor(bufferSize, 0, 1);
+  
+      scriptNode.onaudioprocess = function(audioProcessingEvent) {
+        const outputBuffer = audioProcessingEvent.outputBuffer.getChannelData(0);
+        const sampleCount = outputBuffer.length;
+        const byteSize = sampleCount * 4; // Float32 (4 バイト)
+  
+        // WASM 側のバッファに音声サンプルを書き込んでもらうためのメモリを確保
+        const audioPtr = wasmInstance.exports.malloc(byteSize);
+  
+        // WASM 側の fillAudioBuffer() を呼び出して音声サンプルを取得
+        // ※ WASM 側は sampleCount 個の Float32 サンプルを書き込むものとする
+        wasmInstance.exports.fillAudioBuffer(audioPtr, sampleCount);
+  
+        // WASM のメモリから音声サンプルを取得
+        const audioSamples = new Float32Array(wasmInstance.exports.memory.buffer, audioPtr, sampleCount);
+  
+        // 出力バッファにコピー
+        for (let i = 0; i < sampleCount; i++) {
+          outputBuffer[i] = audioSamples[i];
+        }
+  
+        // 確保したメモリを解放
+        wasmInstance.exports.free(audioPtr);
+      };
+  
+      scriptNode.connect(audioCtx.destination);
+    },
+  
+    pause() {
+      this.running = false;
+      console.log("エミュレーションを一時停止しました。");
+    },
+  
+    resume() {
+      if (!this.running) {
+        this.running = true;
+        console.log("エミュレーションを再開します。");
+        this.runVideo();
+      }
+    }
+  };
+  
+  /*********************************************************
+   * ファイル選択イベントの処理（CD-ROM イメージ読み込み）
+   *
+   * HTML5 File API を利用して、ユーザーが選択した ISO/CUE ファイルを
+   * ArrayBuffer として読み込み、仮想ファイルシステム（BrowserFS）にも保存し、
+   * エミュレータの初期化に渡します。
+   *********************************************************/
+  document.getElementById('fileInput').addEventListener('change', function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+  
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const arrayBuffer = e.target.result;
+  
+      // 仮想ファイルシステムに書き込み（オプション）
+      fs.writeFile('/cdrom.iso', new Uint8Array(arrayBuffer), function(err) {
+        if (err) {
+          console.error("仮想FSへの書き込みエラー:", err);
+        } else {
+          console.log("CD-ROM イメージを仮想FSに保存しました。");
+        }
+      });
+  
+      // エミュレータ初期化：WASM コアへ CD-ROM イメージを渡す
+      emulator.init(arrayBuffer);
+    };
+    reader.readAsArrayBuffer(file);
+  });
+  
+  /*********************************************************
+   * ウィンドウのフォーカス/ブラーに応じた処理
+   *
+   * ・ウィンドウが非アクティブの場合、エミュレーションと AudioContext を一時停止
+   * ・再びアクティブになった場合、再開
+   *********************************************************/
+  window.addEventListener('blur', function() {
+    emulator.pause();
+    audioCtx.suspend().then(() => {
+      console.log("AudioContext をサスペンドしました。");
+    });
+  });
+  
+  window.addEventListener('focus', function() {
+    emulator.resume();
+    audioCtx.resume().then(() => {
+      console.log("AudioContext を再開しました。");
+    });
+  });
+  </script>
+</body>
+</html>
