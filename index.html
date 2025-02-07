@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>NP2 WASM Windows 95 HDI 生成ツール</title>
+  <title>NP2 WASM Windows 95 HDI 生成ツール（改善版）</title>
   <style>
     body { font-family: sans-serif; padding: 20px; }
     button { font-size: 1.2em; padding: 10px 20px; }
@@ -10,8 +10,12 @@
   </style>
 </head>
 <body>
-  <h1>NP2 WASM Windows 95 HDI 生成ツール</h1>
-  <p>以下のボタンをクリックすると、500MB の HDI イメージ（MBR に FAT16 パーティション）が生成されます。</p>
+  <h1>NP2 WASM Windows 95 HDI 生成ツール（改善版）</h1>
+  <p>
+    以下のボタンをクリックすると、500MB の HDI イメージが生成されます。<br>
+    <strong>※ MBR だけでなく、パーティションの先頭（ブートセクター）にも最低限の FAT16 用 BPB を記載しているため、<br>
+    「システムディスクをセットしてください」というエラー回避を試みています。</strong>
+  </p>
   <button id="generateBtn">HDIファイル生成</button>
   <a id="downloadLink" style="display:none;">Download win95.hdi</a>
 
@@ -26,7 +30,7 @@
       const sectorsPerTrack = 63;
       const heads = 255;
       
-      // LBA値から CHS 値に変換する関数
+      // LBA値から CHS 値に変換する関数（MBR用）
       function lbaToChs(lba) {
         const sectorsPerCylinder = heads * sectorsPerTrack;
         const cylinder = Math.floor(lba / sectorsPerCylinder);
@@ -47,7 +51,7 @@
         return [byte0, byte1, byte2];
       }
       
-      // ArrayBuffer を生成（初期値はゼロ埋め）
+      // ArrayBuffer を生成（全体はゼロ埋め）
       let diskBuffer;
       try {
         diskBuffer = new ArrayBuffer(diskSize);
@@ -56,8 +60,9 @@
         return;
       }
       
-      // MBR（最初の512バイト）を操作するための Uint8Array を作成
+      // === MBR の作成（先頭512バイト） ===
       const mbr = new Uint8Array(diskBuffer, 0, sectorSize);
+      mbr.fill(0);
       
       // パーティションテーブルエントリはオフセット446から始まる（16バイト×4エントリ）
       const partitionOffset = 446;
@@ -69,26 +74,24 @@
       const startLBA = 63;
       const startChs = lbaToChs(startLBA);
       const startChsEncoded = encodeChs(startChs);
-      // 書き込み：オフセット 447～449（partitionOffset+1 ～ partitionOffset+3）
       mbr.set(startChsEncoded, partitionOffset + 1);
       
       // 3. パーティションタイプ（0x06 = FAT16、Windows 95 用）
       mbr[partitionOffset + 4] = 0x06;
       
-      // 4. パーティション終了の CHS (パーティションの最終 LBA = totalSectors - 1)
+      // 4. パーティション終了の CHS (最終 LBA = totalSectors - 1)
       const endLBA = totalSectors - 1;
       const endChs = lbaToChs(endLBA);
       const endChsEncoded = encodeChs(endChs);
-      // 書き込み：オフセット 451～453（partitionOffset+5 ～ partitionOffset+7）
       mbr.set(endChsEncoded, partitionOffset + 5);
       
-      // 5. パーティション開始 LBA (リトルエンディアンで4バイト)
+      // 5. パーティション開始 LBA（リトルエンディアン、4バイト）
       mbr[partitionOffset + 8]  = startLBA & 0xFF;
       mbr[partitionOffset + 9]  = (startLBA >> 8) & 0xFF;
       mbr[partitionOffset + 10] = (startLBA >> 16) & 0xFF;
       mbr[partitionOffset + 11] = (startLBA >> 24) & 0xFF;
       
-      // 6. パーティションのセクタ数（全セクタ数から開始位置を引く、リトルエンディアンで4バイト）
+      // 6. パーティションのセクタ数（totalSectors - startLBA、リトルエンディアン、4バイト）
       const partSectors = totalSectors - startLBA;
       mbr[partitionOffset + 12] = partSectors & 0xFF;
       mbr[partitionOffset + 13] = (partSectors >> 8) & 0xFF;
@@ -99,7 +102,79 @@
       mbr[510] = 0x55;
       mbr[511] = 0xAA;
       
-      // Blob として HDI ファイルを作成し、ダウンロードリンクを生成
+      // === パーティションのブートセクター（最初のセクタ：LBA = startLBA）を作成 ===
+      const partitionBootSectorOffset = startLBA * sectorSize;
+      const bootSector = new Uint8Array(diskBuffer, partitionBootSectorOffset, sectorSize);
+      bootSector.fill(0);
+      
+      // 0～2: JMP命令 + NOP (例: EB 3C 90)
+      bootSector[0] = 0xEB;
+      bootSector[1] = 0x3C;
+      bootSector[2] = 0x90;
+      
+      // 3～10: OEM 名（"MSDOS5.0"）
+      const oemName = "MSDOS5.0";
+      for (let i = 0; i < 8; i++) {
+        bootSector[3 + i] = oemName.charCodeAt(i);
+      }
+      
+      // BPB の設定
+      // オフセット11～12: Bytes per sector (512)
+      bootSector[11] = 512 & 0xFF;
+      bootSector[12] = (512 >> 8) & 0xFF;
+      
+      // オフセット13: Sectors per cluster (ここでは16)
+      bootSector[13] = 16;
+      
+      // オフセット14～15: Reserved sectors (1)
+      bootSector[14] = 1;
+      bootSector[15] = 0;
+      
+      // オフセット16: Number of FATs (2)
+      bootSector[16] = 2;
+      
+      // オフセット17～18: Root directory entries (512 = 0x200、リトルエンディアン)
+      bootSector[17] = 512 & 0xFF;
+      bootSector[18] = (512 >> 8) & 0xFF;
+      
+      // オフセット19～20: Total sectors (16bit) → パーティションサイズが大きいため 0
+      bootSector[19] = 0;
+      bootSector[20] = 0;
+      
+      // オフセット21: Media descriptor (0xF8)
+      bootSector[21] = 0xF8;
+      
+      // オフセット22～23: Sectors per FAT (250、リトルエンディアン)
+      bootSector[22] = 250 & 0xFF;
+      bootSector[23] = (250 >> 8) & 0xFF;
+      
+      // オフセット24～25: Sectors per track (63、リトルエンディアン)
+      bootSector[24] = 63 & 0xFF;
+      bootSector[25] = (63 >> 8) & 0xFF;
+      
+      // オフセット26～27: Number of heads (255、リトルエンディアン)
+      bootSector[26] = 255 & 0xFF;
+      bootSector[27] = (255 >> 8) & 0xFF;
+      
+      // オフセット28～31: Hidden sectors (startLBA=63、リトルエンディアン、4バイト)
+      bootSector[28] = startLBA & 0xFF;
+      bootSector[29] = (startLBA >> 8) & 0xFF;
+      bootSector[30] = (startLBA >> 16) & 0xFF;
+      bootSector[31] = (startLBA >> 24) & 0xFF;
+      
+      // オフセット32～35: Total sectors (32bit) → パーティション内のセクタ数 (partSectors)
+      bootSector[32] = partSectors & 0xFF;
+      bootSector[33] = (partSectors >> 8) & 0xFF;
+      bootSector[34] = (partSectors >> 16) & 0xFF;
+      bootSector[35] = (partSectors >> 24) & 0xFF;
+      
+      // （必要に応じてブートコードやメッセージを追加可能ですが、ここでは省略）
+      
+      // ブートセクターのシグネチャ (0x55, 0xAA) を設定（オフセット510～511）
+      bootSector[510] = 0x55;
+      bootSector[511] = 0xAA;
+      
+      // === HDIファイルの書き出し ===
       const blob = new Blob([diskBuffer], { type: "application/octet-stream" });
       const downloadLink = document.getElementById("downloadLink");
       downloadLink.href = URL.createObjectURL(blob);
