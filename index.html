@@ -2,255 +2,111 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>Emulatrix CD-ROM エミュレータ (WASM/Libretro Core版)</title>
+  <title>NP2 WASM Windows 95 HDI 生成ツール</title>
   <style>
-    body {
-      margin: 0;
-      background-color: #000;
-      color: #fff;
-      font-family: sans-serif;
-    }
-    #canvas {
-      display: block;
-      margin: 20px auto;
-      background-color: #222;
-    }
-    #controls {
-      position: fixed;
-      top: 10px;
-      left: 10px;
-      z-index: 100;
-    }
+    body { font-family: sans-serif; padding: 20px; }
+    button { font-size: 1.2em; padding: 10px 20px; }
+    a { font-size: 1.2em; margin-left: 20px; }
   </style>
 </head>
 <body>
-  <!-- ファイル選択（ISO/CUE ファイルのみ） -->
-  <div id="controls">
-    <input type="file" id="fileInput" accept=".iso,.cue">
-  </div>
-  <!-- 映像描画用 Canvas -->
-  <canvas id="canvas" width="640" height="480"></canvas>
-  
-  <!-- BrowserFS を CDN 経由で読み込み -->
-  <script src="https://unpkg.com/browserfs"></script>
-  
+  <h1>NP2 WASM Windows 95 HDI 生成ツール</h1>
+  <p>以下のボタンをクリックすると、500MB の HDI イメージ（MBR に FAT16 パーティション）が生成されます。</p>
+  <button id="generateBtn">HDIファイル生成</button>
+  <a id="downloadLink" style="display:none;">Download win95.hdi</a>
+
   <script>
-  /*********************************************************
-   * BrowserFS の初期化（仮想ファイルシステム）
-   *********************************************************/
-  BrowserFS.configure({ fs: "LocalStorage" }, function(err) {
-    if (err) {
-      console.error("BrowserFS の初期化に失敗:", err);
-    } else {
-      // fs オブジェクトをグローバルに参照可能にする
-      window.fs = BrowserFS.BFSRequire('fs');
-      console.log("BrowserFS が初期化されました。");
-    }
-  });
-  
-  /*********************************************************
-   * AudioContext の初期化（音声出力用）
-   *********************************************************/
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  const audioCtx = new AudioContext();
-  
-  /*********************************************************
-   * Canvas の初期化（映像描画用）
-   *********************************************************/
-  const canvas = document.getElementById('canvas');
-  const ctx = canvas.getContext('2d');
-  
-  /*********************************************************
-   * WASM モジュールの読み込み
-   *
-   * ※ 以下は、WASM 側が以下のエクスポート関数を持つことを前提としています。
-   *   - malloc(size: number): number
-   *   - free(ptr: number): void
-   *   - initEmulator(cdPtr: number, cdSize: number): void
-   *   - runFrame(): void
-   *   - getVideoBufferPtr(): number
-   *   - getVideoBufferWidth(): number
-   *   - getVideoBufferHeight(): number
-   *   - fillAudioBuffer(ptr: number, sampleCount: number): void
-   *
-   * また、インポート側（env）にはメモリ・テーブル等を提供します。
-   *********************************************************/
-  let wasmInstance = null;
-  
-  async function loadWasmModule() {
-    const response = await fetch('emulator_core.wasm');
-    const bytes = await response.arrayBuffer();
-    const importObject = {
-      env: {
-        // WASM 側で利用するメモリ（初期 256 ページ＝16MB、必要に応じて調整）
-        memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
-        table: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }),
-        // 簡易なログ出力用関数（WASM 側から呼び出せる）
-        js_log: (ptr, len) => {
-          const bytes = new Uint8Array(wasmInstance.exports.memory.buffer, ptr, len);
-          const message = new TextDecoder('utf8').decode(bytes);
-          console.log("WASM:", message);
-        },
-        abort: () => { console.error("WASM: abort() が呼ばれました。"); }
+    document.getElementById("generateBtn").addEventListener("click", function() {
+      // ディスクパラメータの定義
+      const diskSize = 500 * 1024 * 1024; // 500MB
+      const sectorSize = 512;
+      const totalSectors = diskSize / sectorSize;
+      
+      // CHS（Cylinder-Head-Sector）用の仮想ジオメトリ
+      const sectorsPerTrack = 63;
+      const heads = 255;
+      
+      // LBA値から CHS 値に変換する関数
+      function lbaToChs(lba) {
+        const sectorsPerCylinder = heads * sectorsPerTrack;
+        const cylinder = Math.floor(lba / sectorsPerCylinder);
+        const temp = lba % sectorsPerCylinder;
+        const head = Math.floor(temp / sectorsPerTrack);
+        const sector = (temp % sectorsPerTrack) + 1; // sector は1～63
+        return { cylinder, head, sector };
       }
-    };
-    const result = await WebAssembly.instantiate(bytes, importObject);
-    return result.instance;
-  }
-  
-  /*********************************************************
-   * エミュレータ本体
-   *
-   * ・init(cdData): CD-ROM イメージを WASM コアに渡して初期化
-   * ・runVideo(): requestAnimationFrame により各フレームの映像描画
-   * ・startAudio(): ScriptProcessorNode により音声出力
-   * ・pause() / resume(): フォーカスに応じたエミュレーションの一時停止・再開
-   *********************************************************/
-  const emulator = {
-    running: false,
-    async init(cdData) {
-      // WASM モジュールを読み込む
-      wasmInstance = await loadWasmModule();
-      console.log("WASM モジュールがロードされました。");
-  
-      // cdData（ArrayBuffer）を WASM 側に渡すためにメモリへコピー
-      const cdSize = cdData.byteLength;
-      const cdPtr = wasmInstance.exports.malloc(cdSize);
-      new Uint8Array(wasmInstance.exports.memory.buffer, cdPtr, cdSize).set(new Uint8Array(cdData));
-  
-      // WASM コアの初期化（CD-ROM イメージを渡す）
-      wasmInstance.exports.initEmulator(cdPtr, cdSize);
-      console.log("エミュレーター初期化完了。");
-  
-      // ※ 必要に応じて、cdPtr の解放（free）を行う。ここでは内部でコピーしている前提。
-      // wasmInstance.exports.free(cdPtr);
-  
-      // エミュレーション開始
-      this.running = true;
-      this.startAudio();
-      this.runVideo();
-    },
-  
-    runVideo() {
-      const loop = () => {
-        if (!this.running) return;
-  
-        // 1フレーム分のエミュレーション処理を WASM 側で実行
-        wasmInstance.exports.runFrame();
-  
-        // WASM 側で生成された映像バッファの情報を取得
-        const videoPtr   = wasmInstance.exports.getVideoBufferPtr();
-        const width      = wasmInstance.exports.getVideoBufferWidth();
-        const height     = wasmInstance.exports.getVideoBufferHeight();
-        const pixelCount = width * height;
-  
-        // RGBA の 8bit データ（width * height * 4 バイト）の映像データを取得
-        const videoBuffer = new Uint8ClampedArray(wasmInstance.exports.memory.buffer, videoPtr, pixelCount * 4);
-  
-        // ImageData を生成して Canvas に描画
-        const imageData = new ImageData(videoBuffer, width, height);
-        ctx.putImageData(imageData, 0, 0);
-  
-        requestAnimationFrame(loop);
-      };
-      requestAnimationFrame(loop);
-    },
-  
-    startAudio() {
-      // ScriptProcessorNode を用いた音声出力（推奨: AudioWorklet の利用）
-      const bufferSize = 4096;
-      const scriptNode = audioCtx.createScriptProcessor(bufferSize, 0, 1);
-  
-      scriptNode.onaudioprocess = function(audioProcessingEvent) {
-        const outputBuffer = audioProcessingEvent.outputBuffer.getChannelData(0);
-        const sampleCount = outputBuffer.length;
-        const byteSize = sampleCount * 4; // Float32 (4 バイト)
-  
-        // WASM 側のバッファに音声サンプルを書き込んでもらうためのメモリを確保
-        const audioPtr = wasmInstance.exports.malloc(byteSize);
-  
-        // WASM 側の fillAudioBuffer() を呼び出して音声サンプルを取得
-        // ※ WASM 側は sampleCount 個の Float32 サンプルを書き込むものとする
-        wasmInstance.exports.fillAudioBuffer(audioPtr, sampleCount);
-  
-        // WASM のメモリから音声サンプルを取得
-        const audioSamples = new Float32Array(wasmInstance.exports.memory.buffer, audioPtr, sampleCount);
-  
-        // 出力バッファにコピー
-        for (let i = 0; i < sampleCount; i++) {
-          outputBuffer[i] = audioSamples[i];
-        }
-  
-        // 確保したメモリを解放
-        wasmInstance.exports.free(audioPtr);
-      };
-  
-      scriptNode.connect(audioCtx.destination);
-    },
-  
-    pause() {
-      this.running = false;
-      console.log("エミュレーションを一時停止しました。");
-    },
-  
-    resume() {
-      if (!this.running) {
-        this.running = true;
-        console.log("エミュレーションを再開します。");
-        this.runVideo();
+      
+      // CHS オブジェクトを MBR の3バイト形式にエンコードする関数
+      function encodeChs(chs) {
+        // 1バイト目: head
+        const byte0 = chs.head;
+        // 2バイト目: 下位6ビットに sector、上位2ビットに cylinder の上位2ビット
+        const byte1 = (chs.sector & 0x3F) | (((chs.cylinder >> 8) & 0x03) << 6);
+        // 3バイト目: cylinder の下位8ビット
+        const byte2 = chs.cylinder & 0xFF;
+        return [byte0, byte1, byte2];
       }
-    }
-  };
-  
-  /*********************************************************
-   * ファイル選択イベントの処理（CD-ROM イメージ読み込み）
-   *
-   * HTML5 File API を利用して、ユーザーが選択した ISO/CUE ファイルを
-   * ArrayBuffer として読み込み、仮想ファイルシステム（BrowserFS）にも保存し、
-   * エミュレータの初期化に渡します。
-   *********************************************************/
-  document.getElementById('fileInput').addEventListener('change', function(event) {
-    const file = event.target.files[0];
-    if (!file) return;
-  
-    const reader = new FileReader();
-    reader.onload = function(e) {
-      const arrayBuffer = e.target.result;
-  
-      // 仮想ファイルシステムに書き込み（オプション）
-      fs.writeFile('/cdrom.iso', new Uint8Array(arrayBuffer), function(err) {
-        if (err) {
-          console.error("仮想FSへの書き込みエラー:", err);
-        } else {
-          console.log("CD-ROM イメージを仮想FSに保存しました。");
-        }
-      });
-  
-      // エミュレータ初期化：WASM コアへ CD-ROM イメージを渡す
-      emulator.init(arrayBuffer);
-    };
-    reader.readAsArrayBuffer(file);
-  });
-  
-  /*********************************************************
-   * ウィンドウのフォーカス/ブラーに応じた処理
-   *
-   * ・ウィンドウが非アクティブの場合、エミュレーションと AudioContext を一時停止
-   * ・再びアクティブになった場合、再開
-   *********************************************************/
-  window.addEventListener('blur', function() {
-    emulator.pause();
-    audioCtx.suspend().then(() => {
-      console.log("AudioContext をサスペンドしました。");
+      
+      // ArrayBuffer を生成（初期値はゼロ埋め）
+      let diskBuffer;
+      try {
+        diskBuffer = new ArrayBuffer(diskSize);
+      } catch (e) {
+        alert("メモリ確保に失敗しました。ディスクサイズを小さくしてください。");
+        return;
+      }
+      
+      // MBR（最初の512バイト）を操作するための Uint8Array を作成
+      const mbr = new Uint8Array(diskBuffer, 0, sectorSize);
+      
+      // パーティションテーブルエントリはオフセット446から始まる（16バイト×4エントリ）
+      const partitionOffset = 446;
+      
+      // 1. ブートフラグ（0x80 = ブート可能）
+      mbr[partitionOffset + 0] = 0x80;
+      
+      // 2. パーティション開始の CHS (LBA = 63)
+      const startLBA = 63;
+      const startChs = lbaToChs(startLBA);
+      const startChsEncoded = encodeChs(startChs);
+      // 書き込み：オフセット 447～449（partitionOffset+1 ～ partitionOffset+3）
+      mbr.set(startChsEncoded, partitionOffset + 1);
+      
+      // 3. パーティションタイプ（0x06 = FAT16、Windows 95 用）
+      mbr[partitionOffset + 4] = 0x06;
+      
+      // 4. パーティション終了の CHS (パーティションの最終 LBA = totalSectors - 1)
+      const endLBA = totalSectors - 1;
+      const endChs = lbaToChs(endLBA);
+      const endChsEncoded = encodeChs(endChs);
+      // 書き込み：オフセット 451～453（partitionOffset+5 ～ partitionOffset+7）
+      mbr.set(endChsEncoded, partitionOffset + 5);
+      
+      // 5. パーティション開始 LBA (リトルエンディアンで4バイト)
+      mbr[partitionOffset + 8]  = startLBA & 0xFF;
+      mbr[partitionOffset + 9]  = (startLBA >> 8) & 0xFF;
+      mbr[partitionOffset + 10] = (startLBA >> 16) & 0xFF;
+      mbr[partitionOffset + 11] = (startLBA >> 24) & 0xFF;
+      
+      // 6. パーティションのセクタ数（全セクタ数から開始位置を引く、リトルエンディアンで4バイト）
+      const partSectors = totalSectors - startLBA;
+      mbr[partitionOffset + 12] = partSectors & 0xFF;
+      mbr[partitionOffset + 13] = (partSectors >> 8) & 0xFF;
+      mbr[partitionOffset + 14] = (partSectors >> 16) & 0xFF;
+      mbr[partitionOffset + 15] = (partSectors >> 24) & 0xFF;
+      
+      // 7. MBR のシグネチャ (0x55, 0xAA)
+      mbr[510] = 0x55;
+      mbr[511] = 0xAA;
+      
+      // Blob として HDI ファイルを作成し、ダウンロードリンクを生成
+      const blob = new Blob([diskBuffer], { type: "application/octet-stream" });
+      const downloadLink = document.getElementById("downloadLink");
+      downloadLink.href = URL.createObjectURL(blob);
+      downloadLink.download = "win95.hdi";
+      downloadLink.style.display = "inline";
+      downloadLink.textContent = "Download win95.hdi";
     });
-  });
-  
-  window.addEventListener('focus', function() {
-    emulator.resume();
-    audioCtx.resume().then(() => {
-      console.log("AudioContext を再開しました。");
-    });
-  });
   </script>
 </body>
 </html>
